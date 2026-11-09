@@ -467,6 +467,28 @@ private fun addWatermark(context: Context, input: File, directory: File): File {
         "youtubedl-android/packages/ffmpeg/usr/lib"
     )
     check(ffmpegLibraries.isDirectory) { "Les bibliothèques FFmpeg ne sont pas initialisées." }
+    val pythonLibraries = File(
+        context.noBackupFilesDir,
+        "youtubedl-android/packages/python/usr/lib"
+    )
+    check(pythonLibraries.isDirectory) { "Les bibliothèques Python ne sont pas initialisées." }
+    val appNativeLibraries = File(context.filesDir, "native-libraries").apply {
+        check(isDirectory || mkdirs()) { "Impossible de préparer les bibliothèques natives." }
+    }
+    listOf(
+        "libcrypto.so.3",
+        "libssl.so.3",
+        "libexpat.so.1",
+        "libandroid-posix-semaphore.so"
+    ).forEach { name ->
+        val library = File(appNativeLibraries, name)
+        if (!library.isFile || library.length() == 0L) {
+            context.assets.open("native-libs/$name").use { source ->
+                library.outputStream().use { destination -> source.copyTo(destination) }
+            }
+        }
+        check(library.isFile && library.length() > 0) { "Bibliothèque native incomplète : $name" }
+    }
 
     val watermark = File(directory, "watermark.png")
     createWatermark(watermark)
@@ -491,7 +513,7 @@ private fun addWatermark(context: Context, input: File, directory: File): File {
     )
     val process = ProcessBuilder(command).redirectErrorStream(true).apply {
         environment()["LD_LIBRARY_PATH"] =
-            "${ffmpegLibraries.absolutePath}:${context.applicationInfo.nativeLibraryDir}"
+            "${appNativeLibraries.absolutePath}:${ffmpegLibraries.absolutePath}:${pythonLibraries.absolutePath}:${context.applicationInfo.nativeLibraryDir}"
     }.start()
     val logTail = ArrayDeque<String>()
     process.inputStream.bufferedReader().useLines { lines ->
