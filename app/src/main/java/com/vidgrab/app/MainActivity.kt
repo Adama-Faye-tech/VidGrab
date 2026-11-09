@@ -13,7 +13,6 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
-import android.graphics.RectF
 import android.graphics.Typeface
 import android.net.Uri
 import android.os.Build
@@ -644,18 +643,39 @@ private fun addWatermark(context: Context, input: File, directory: File, process
 }
 
 private fun createWatermark(file: File) {
-    val bitmap = Bitmap.createBitmap(600, 128, Bitmap.Config.ARGB_8888)
+    val bitmap = Bitmap.createBitmap(1000, 260, Bitmap.Config.ARGB_8888)
     val canvas = Canvas(bitmap)
-    val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(175, 16, 29, 53)
-    }
-    canvas.drawRoundRect(RectF(0f, 0f, 600f, 128f), 24f, 24f, backgroundPaint)
     val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.WHITE
-        textSize = 68f
-        typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+        textSize = 178f
+        textScaleX = 1.12f
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD)
+        strokeJoin = Paint.Join.ROUND
     }
-    canvas.drawText("Adama Faye", 28f, 88f, textPaint)
+    val baseline = bitmap.height / 2f - (textPaint.ascent() + textPaint.descent()) / 2f
+
+    textPaint.style = Paint.Style.STROKE
+    textPaint.strokeWidth = 16f
+    textPaint.color = Color.argb(105, 95, 95, 95)
+    canvas.drawText("VibGrab", bitmap.width / 2f, baseline, textPaint)
+
+    textPaint.strokeWidth = 10f
+    textPaint.color = Color.argb(180, 160, 160, 160)
+    canvas.drawText("VibGrab", bitmap.width / 2f, baseline, textPaint)
+
+    textPaint.strokeWidth = 4f
+    textPaint.color = Color.argb(220, 245, 245, 245)
+    canvas.drawText("VibGrab", bitmap.width / 2f, baseline, textPaint)
+
+    textPaint.style = Paint.Style.FILL
+    textPaint.color = Color.argb(95, 125, 125, 125)
+    canvas.drawText("VibGrab", bitmap.width / 2f, baseline, textPaint)
+
+    textPaint.style = Paint.Style.STROKE
+    textPaint.strokeWidth = 1.5f
+    textPaint.color = Color.argb(210, 220, 220, 220)
+    canvas.drawText("VibGrab", bitmap.width / 2f, baseline, textPaint)
+
     file.outputStream().use { stream ->
         check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)) {
             "Impossible de créer le filigrane."
