@@ -15,6 +15,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.Typeface
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
@@ -45,6 +46,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -55,12 +57,17 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.yausername.youtubedl_android.YoutubeDL
 import com.yausername.youtubedl_android.YoutubeDLRequest
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 class MainActivity : ComponentActivity() {
     private var shared by mutableStateOf("")
@@ -93,10 +100,39 @@ private enum class VideoQuality(val label: String, val maxHeight: Int?) {
 
 private data class DownloadItem(
     val id: Int,
+    val processId: String,
     val url: String,
     val progress: Float = 0f,
-    val status: String = "En attente"
+    val status: String = "En attente",
+    val active: Boolean = true,
+    val downloadedUri: Uri? = null
 )
+
+private data class DownloadResult(val fileName: String, val uri: Uri)
+
+private object ActiveDownloadProcesses {
+    private val watermarkProcesses = ConcurrentHashMap<String, Process>()
+    private val cancelledIds = ConcurrentHashMap.newKeySet<String>()
+
+    fun cancel(processId: String) {
+        cancelledIds.add(processId)
+        YoutubeDL.getInstance().destroyProcessById(processId)
+        watermarkProcesses.remove(processId)?.destroyForcibly()
+    }
+
+    fun registerWatermark(processId: String, process: Process) {
+        watermarkProcesses[processId] = process
+        if (cancelledIds.contains(processId)) {
+            watermarkProcesses.remove(processId, process)
+            process.destroyForcibly()
+        }
+    }
+
+    fun finish(processId: String) {
+        watermarkProcesses.remove(processId)
+        cancelledIds.remove(processId)
+    }
+}
 
 @Composable
 private fun Screen(initial: String) {
@@ -113,6 +149,7 @@ private fun Screen(initial: String) {
     var pendingAudioOnly by remember { mutableStateOf(false) }
     var pendingFrenchSubtitles by remember { mutableStateOf(true) }
     val items = remember { mutableStateListOf<DownloadItem>() }
+    val downloadJobs = remember { mutableStateMapOf<Int, Job>() }
 
     val startDownloads: (List<String>, VideoQuality, Boolean, Boolean, Boolean) -> Unit =
         { links, selectedQuality, audio, includeFrenchSubtitles, notificationsEnabled ->
@@ -120,11 +157,14 @@ private fun Screen(initial: String) {
                 "Notifications désactivées : la progression reste visible dans l’application."
             links.forEach { link ->
                 val id = UUID.randomUUID().hashCode() and Int.MAX_VALUE
-                items.add(DownloadItem(id = id, url = link, status = "Téléchargement"))
-                scope.launch {
+                val processId = UUID.randomUUID().toString()
+                items.add(
+                    DownloadItem(id = id, processId = processId, url = link, status = "Téléchargement")
+                )
+                val job = scope.launch(start = CoroutineStart.LAZY) {
                     fun updateItem(progress: Float? = null, status: String? = null) {
                         val index = items.indexOfFirst { it.id == id }
-                        if (index >= 0) {
+                        if (index >= 0 && items[index].active) {
                             items[index] = items[index].copy(
                                 progress = progress ?: items[index].progress,
                                 status = status ?: items[index].status
@@ -133,12 +173,13 @@ private fun Screen(initial: String) {
                     }
 
                     try {
-                        val fileName = download(
+                        val result = download(
                             context,
                             link,
                             audio,
                             selectedQuality,
                             includeFrenchSubtitles,
+                            processId,
                             onProgress = { value ->
                                 scope.launch { updateItem(progress = value) }
                                 if (notificationsEnabled) {
@@ -152,18 +193,47 @@ private fun Screen(initial: String) {
                                 }
                             }
                         )
-                        updateItem(progress = 100f, status = "Terminé · $fileName")
-                        if (notificationsEnabled) {
-                            DownloadNotifications.showCompleted(context, id, fileName)
+                        val index = items.indexOfFirst { it.id == id }
+                        if (index >= 0 && items[index].active) {
+                            items[index] = items[index].copy(
+                                progress = 100f,
+                                status = "Terminé · ${result.fileName}",
+                                active = false,
+                                downloadedUri = result.uri
+                            )
                         }
+                        if (notificationsEnabled) {
+                            DownloadNotifications.showCompleted(context, id, result.fileName)
+                        }
+                    } catch (e: CancellationException) {
+                        val index = items.indexOfFirst { it.id == id }
+                        if (index >= 0 && items[index].active) {
+                            items[index] = items[index].copy(status = "Arrêté", active = false)
+                        }
+                        DownloadNotifications.cancel(context, id)
+                        throw e
                     } catch (e: Exception) {
-                        if (e is CancellationException) throw e
-                        updateItem(status = "Erreur · ${e.message ?: "échec du téléchargement"}")
-                        if (notificationsEnabled) {
-                            DownloadNotifications.showFailed(context, id, e.message ?: "Échec du téléchargement")
+                        val index = items.indexOfFirst { it.id == id }
+                        if (index >= 0 && items[index].active) {
+                            items[index] = items[index].copy(
+                                status = "Erreur · ${e.message ?: "échec du téléchargement"}",
+                                active = false
+                            )
+                            if (notificationsEnabled) {
+                                DownloadNotifications.showFailed(
+                                    context,
+                                    id,
+                                    e.message ?: "Échec du téléchargement"
+                                )
+                            }
                         }
+                    } finally {
+                        downloadJobs.remove(id)
+                        ActiveDownloadProcesses.finish(processId)
                     }
                 }
+                downloadJobs[id] = job
+                job.start()
             }
         }
 
@@ -249,6 +319,8 @@ private fun Screen(initial: String) {
                     pendingQuality = quality
                     pendingAudioOnly = audioOnly
                     pendingFrenchSubtitles = frenchSubtitles
+                    linksText = ""
+                    message = ""
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
                         context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
                         PackageManager.PERMISSION_GRANTED
@@ -268,7 +340,7 @@ private fun Screen(initial: String) {
             enabled = linksText.isNotBlank(),
             modifier = Modifier.fillMaxWidth()
         ) {
-            Text("Démarrer ${parseLinks(linksText).size.coerceAtLeast(1)} téléchargement(s)")
+            Text("Télécharger ${parseLinks(linksText).size.coerceAtLeast(1)} lien(s)")
         }
         if (message.isNotBlank()) Text(message, style = MaterialTheme.typography.bodySmall)
         items.forEach { item ->
@@ -285,6 +357,36 @@ private fun Screen(initial: String) {
                             modifier = Modifier.fillMaxWidth()
                         )
                         Text("${item.progress.toInt()} %")
+                    }
+                    Button(
+                        onClick = {
+                            if (item.active) {
+                                ActiveDownloadProcesses.cancel(item.processId)
+                                downloadJobs[item.id]?.cancel()
+                                DownloadNotifications.cancel(context, item.id)
+                                val index = items.indexOfFirst { it.id == item.id }
+                                if (index >= 0) {
+                                    items[index] = items[index].copy(
+                                        status = "Arrêté",
+                                        active = false
+                                    )
+                                }
+                            } else {
+                                try {
+                                    item.downloadedUri?.let { uri ->
+                                        check(context.contentResolver.delete(uri, null, null) > 0) {
+                                            "Le fichier téléchargé n’a pas pu être supprimé."
+                                        }
+                                    }
+                                    items.removeAll { it.id == item.id }
+                                    DownloadNotifications.cancel(context, item.id)
+                                } catch (e: Exception) {
+                                    message = "Erreur de suppression : ${e.message ?: "échec"}"
+                                }
+                            }
+                        }
+                    ) {
+                        Text(if (item.active) "Arrêter" else "Supprimer")
                     }
                 }
             }
@@ -370,6 +472,10 @@ private object DownloadNotifications {
             .build())
     }
 
+    fun cancel(context: Context, id: Int) {
+        context.getSystemService(NotificationManager::class.java).cancel(id)
+    }
+
     private fun hostName(url: String): String =
         android.net.Uri.parse(url).host ?: "Vidéo"
 
@@ -396,9 +502,10 @@ private suspend fun download(
     audioOnly: Boolean,
     quality: VideoQuality,
     includeFrenchSubtitles: Boolean,
+    processId: String,
     onProgress: (Float) -> Unit,
     onProcessing: () -> Unit
-): String = withContext(Dispatchers.IO) {
+): DownloadResult = withContext(Dispatchers.IO) {
     val dir = File(context.cacheDir, "dl/${UUID.randomUUID()}").apply {
         check(mkdirs()) { "Impossible de préparer le téléchargement." }
     }
@@ -423,9 +530,11 @@ private suspend fun download(
                 request.addOption("--embed-subs")
             }
         }
-        YoutubeDL.getInstance().execute(request, null) { progress, _, _ ->
+        currentCoroutineContext().ensureActive()
+        YoutubeDL.getInstance().execute(request, processId) { progress, _, _ ->
             onProgress(progress.coerceIn(0f, 100f))
         }
+        currentCoroutineContext().ensureActive()
         val videoExtensions = setOf("mp4", "mkv", "webm", "m4v", "mov", "flv", "avi")
         val downloadedFile = dir.listFiles()?.firstOrNull {
             it.isFile && it.extension.lowercase() in videoExtensions
@@ -433,8 +542,9 @@ private suspend fun download(
             ?: error("Le fichier téléchargé est introuvable.")
         val outputFile = if (audioOnly) downloadedFile else {
             onProcessing()
-            addWatermark(context, downloadedFile, dir)
+            addWatermark(context, downloadedFile, dir, processId)
         }
+        currentCoroutineContext().ensureActive()
         val values = ContentValues().apply {
             put(MediaStore.Downloads.DISPLAY_NAME, outputFile.name)
             put(
@@ -449,17 +559,19 @@ private suspend fun download(
             val output = context.contentResolver.openOutputStream(uri)
                 ?: error("Impossible d’ouvrir le fichier de destination.")
             output.use { stream -> outputFile.inputStream().use { it.copyTo(stream) } }
+            currentCoroutineContext().ensureActive()
         } catch (e: Exception) {
             context.contentResolver.delete(uri, null, null)
             throw e
         }
-        outputFile.name
+        DownloadResult(outputFile.name, uri)
     } finally {
         dir.deleteRecursively()
+        ActiveDownloadProcesses.finish(processId)
     }
 }
 
-private fun addWatermark(context: Context, input: File, directory: File): File {
+private fun addWatermark(context: Context, input: File, directory: File, processId: String): File {
     val ffmpeg = File(context.applicationInfo.nativeLibraryDir, "libffmpeg.so")
     check(ffmpeg.isFile) { "Le moteur vidéo FFmpeg est introuvable." }
     val ffmpegLibraries = File(
@@ -515,6 +627,7 @@ private fun addWatermark(context: Context, input: File, directory: File): File {
         environment()["LD_LIBRARY_PATH"] =
             "${appNativeLibraries.absolutePath}:${ffmpegLibraries.absolutePath}:${pythonLibraries.absolutePath}:${context.applicationInfo.nativeLibraryDir}"
     }.start()
+    ActiveDownloadProcesses.registerWatermark(processId, process)
     val logTail = ArrayDeque<String>()
     process.inputStream.bufferedReader().useLines { lines ->
         lines.forEach { line ->
